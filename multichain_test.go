@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"io/ioutil"
+	"log"
 	"math/big"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing/quick"
 	"time"
@@ -940,342 +940,342 @@ var _ = Describe("Multichain", func() {
 			}
 
 			Context(fmt.Sprintf("%v", utxoChain.chain), func() {
-				Specify("(P2PKH) build, broadcast and fetch tx", func() {
-					// Load private key.
-					pkEnv := os.Getenv(utxoChain.privKeyEnv)
-					if pkEnv == "" {
-						panic(fmt.Sprintf("%v is undefined", utxoChain.privKeyEnv))
-					}
-					wif, err := btcutil.DecodeWIF(pkEnv)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Get the PKH address from the loaded private key.
-					pkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeCompressed()))
-					Expect(err).NotTo(HaveOccurred())
-
-					// Recipient 1
-					pkhAddrUncompressed, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeUncompressed()))
-					Expect(err).ToNot(HaveOccurred())
-
-					// Recipient 2
-					recipientPrivKey, err := btcec.NewPrivateKey()
-					Expect(err).NotTo(HaveOccurred())
-					recipientPubKey := recipientPrivKey.PubKey()
-					recipientPubKeyCompressed := recipientPubKey.SerializeCompressed()
-					recipientPkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(recipientPubKey.SerializeCompressed()))
-					Expect(err).NotTo(HaveOccurred())
-
-					// Initialise the UTXO client and fetch the unspent outputs. Also get a
-					// function to query the number of block confirmations for a transaction.
-					utxoClient, unspentOutputs, confsFn := utxoChain.initialise(utxoChain.rpcURL, pkhAddr)
-					Expect(len(unspentOutputs)).To(BeNumerically(">", 0))
-					var output multichain.UTXOutput
-					thresholdValue := pack.NewU256FromU64(pack.NewU64(2500))
-					for _, unspentOutput := range unspentOutputs {
-						if unspentOutput.Value.GreaterThan(thresholdValue) {
-							output = unspentOutput
-							break
-						}
-					}
-
-					// Build a transaction
-					inputs := []multichain.UTXOInput{
-						{Output: multichain.UTXOutput{
-							Outpoint: multichain.UTXOutpoint{
-								Hash:  output.Outpoint.Hash[:],
-								Index: output.Outpoint.Index,
-							},
-							PubKeyScript: output.PubKeyScript,
-							Value:        output.Value,
-						}},
-					}
-					utxoValue1 := pack.NewU256FromU64(pack.NewU64((output.Value.Int().Uint64() - 1000) / 4))
-					utxoValue2 := pack.NewU256FromU64(pack.NewU64((output.Value.Int().Uint64() - 1000) * 3 / 4))
-					recipients := []multichain.UTXORecipient{
-						{
-							To:    multichain.Address(pkhAddrUncompressed.EncodeAddress()),
-							Value: utxoValue1,
-						},
-						{
-							To:    multichain.Address(recipientPkhAddr.EncodeAddress()),
-							Value: utxoValue2,
-						},
-					}
-					utxoTx, err := utxoChain.txBuilder.BuildTx(inputs, recipients)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Get the sighashes that need to be signed, and sign them.
-					sighashes, err := utxoTx.Sighashes()
-					signatures := make([]pack.Bytes65, len(sighashes))
-					Expect(err).ToNot(HaveOccurred())
-					for i := range sighashes {
-						hash := id.Hash(sighashes[i])
-						privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures[i] = pack.NewBytes65(signature)
-					}
-					Expect(utxoTx.Sign(signatures, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
-
-					// Submit the signed transaction to the UTXO chain's node.
-					txHash, err := utxoTx.Hash()
-					Expect(err).ToNot(HaveOccurred())
-					err = utxoClient.SubmitTx(ctx, utxoTx)
-					Expect(err).ToNot(HaveOccurred())
-
-					// Check confirmations after waiting for the transaction to be in the
-					// mempool.
-					time.Sleep(time.Second)
-					for {
-						// Loop until the transaction has at least a few
-						// confirmations.
-						confs, err := confsFn(ctx, txHash)
-						Expect(err).ToNot(HaveOccurred())
-						logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
-						if confs >= 1 {
-							break
-						}
-						time.Sleep(10 * time.Second)
-					}
-
-					// Load the output and verify that it is equal to the original output.
-					output2, _, err := utxoClient.Output(ctx, output.Outpoint)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(reflect.DeepEqual(output, output2)).To(BeTrue())
-
-					// Load the first output and verify the value.
-					output3, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
-						Hash:  txHash,
-						Index: pack.NewU32(0),
-					})
-					Expect(err).ToNot(HaveOccurred())
-					Expect(output3.Value).To(Equal(utxoValue1))
-
-					// Load the second output and verify the value.
-					output4, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
-						Hash:  txHash,
-						Index: pack.NewU32(1),
-					})
-					Expect(err).ToNot(HaveOccurred())
-					Expect(output4.Value).To(Equal(utxoValue2))
-
-					// Construct UTXO to be signed by invalid key. This UTXO should fail
-					// when submitted to the network, since the signer doesn't have the
-					// right to spend it.
-					// We submit the invalid signed UTXO (which should fail), and wait
-					// for a maximum of 5 seconds.
-					inputs2 := []multichain.UTXOInput{{
-						Output: output4,
-					}}
-					recipients2 := []multichain.UTXORecipient{{
-						To:    multichain.Address(pkhAddr.EncodeAddress()),
-						Value: output4.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
-					}}
-					utxoTx2, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
-					Expect(err).NotTo(HaveOccurred())
-					sighashes2, err := utxoTx2.Sighashes()
-					signatures2 := make([]pack.Bytes65, len(sighashes2))
-					for i := range sighashes2 {
-						hash := id.Hash(sighashes2[i])
-						privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures2[i] = pack.NewBytes65(signature)
-					}
-					Expect(utxoTx2.Sign(signatures2, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
-					failingCtx, failingCancelFn := context.WithTimeout(ctx, 5*time.Second)
-					Expect(utxoClient.SubmitTx(failingCtx, utxoTx2)).To(HaveOccurred())
-					failingCancelFn()
-
-					// Try to spend UTXO from valid key. We should be able to successfully
-					// submit the signed UTXO to the network.
-					utxoTx3, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
-					Expect(err).NotTo(HaveOccurred())
-					sighashes3, err := utxoTx3.Sighashes()
-					signatures3 := make([]pack.Bytes65, len(sighashes3))
-					for i := range sighashes3 {
-						hash := id.Hash(sighashes3[i])
-						privKey := (*id.PrivKey)(recipientPrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures3[i] = pack.NewBytes65(signature)
-					}
-					Expect(utxoTx3.Sign(signatures3, pack.NewBytes(recipientPubKeyCompressed))).To(Succeed())
-					Expect(utxoClient.SubmitTx(ctx, utxoTx3)).NotTo(HaveOccurred())
-				})
-
-				Specify("(P2SH)  build, broadcast and fetch tx", func() {
-					// Load private key.
-					pkEnv := os.Getenv(utxoChain.privKeyEnv)
-					if pkEnv == "" {
-						panic(fmt.Sprintf("%v is undefined", utxoChain.privKeyEnv))
-					}
-					wif, err := btcutil.DecodeWIF(pkEnv)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Get the PKH address from the loaded private key.
-					pkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeCompressed()))
-					Expect(err).NotTo(HaveOccurred())
-
-					// Recipient
-					recipientPrivKey, err := btcec.NewPrivateKey()
-					Expect(err).NotTo(HaveOccurred())
-					recipientPubKey := recipientPrivKey.PubKey()
-					recipientPubKeyCompressed := recipientPubKey.SerializeCompressed()
-					pubKey := pack.Bytes(((*btcec.PublicKey)(recipientPubKey)).SerializeCompressed())
-					script, err := getScript(pubKey)
-					Expect(err).NotTo(HaveOccurred())
-					pubKeyScript, err := getPubKeyScript(pubKey)
-					Expect(err).NotTo(HaveOccurred())
-					recipientP2SH, err := utxoChain.newAddressSH(script)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Initialise the UTXO client and fetch the unspent outputs. Also get a
-					// function to query the number of block confirmations for a transaction.
-					utxoClient, unspentOutputs, confsFn := utxoChain.initialise(utxoChain.rpcURL, pkhAddr)
-					Expect(len(unspentOutputs)).To(BeNumerically(">", 0))
-					var output multichain.UTXOutput
-					thresholdValue := pack.NewU256FromU64(pack.NewU64(2500))
-					for _, unspentOutput := range unspentOutputs {
-						if unspentOutput.Value.GreaterThan(thresholdValue) {
-							output = unspentOutput
-							break
-						}
-					}
-
-					// Build a transaction
-					inputs := []multichain.UTXOInput{
-						{Output: multichain.UTXOutput{
-							Outpoint: multichain.UTXOutpoint{
-								Hash:  output.Outpoint.Hash[:],
-								Index: output.Outpoint.Index,
-							},
-							PubKeyScript: output.PubKeyScript,
-							Value:        output.Value,
-						}},
-					}
-					recipients := []multichain.UTXORecipient{
-						{
-							To:    multichain.Address(recipientP2SH.EncodeAddress()),
-							Value: output.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
-						},
-					}
-					utxoTx, err := utxoChain.txBuilder.BuildTx(inputs, recipients)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Get the sighashes that need to be signed, and sign them.
-					sighashes, err := utxoTx.Sighashes()
-					signatures := make([]pack.Bytes65, len(sighashes))
-					Expect(err).ToNot(HaveOccurred())
-					for i := range sighashes {
-						hash := id.Hash(sighashes[i])
-						privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures[i] = pack.NewBytes65(signature)
-					}
-					Expect(utxoTx.Sign(signatures, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
-					// Submit the signed transaction to the UTXO chain's node.
-					txHash, err := utxoTx.Hash()
-					Expect(err).ToNot(HaveOccurred())
-					err = utxoClient.SubmitTx(ctx, utxoTx)
-					Expect(err).ToNot(HaveOccurred())
-					logger.Debug("[P2KH -> P2SH] submit tx", zap.String("from", pkhAddr.EncodeAddress()), zap.String("to", recipientP2SH.EncodeAddress()), zap.String("txHash", string(txHashToHex(txHash))))
-					// Check confirmations after waiting for the transaction to be in the
-					// mempool.
-					time.Sleep(time.Second)
-
-					for {
-						// Loop until the transaction has at least a few
-						// confirmations.
-						confs, err := confsFn(ctx, txHash)
-						Expect(err).ToNot(HaveOccurred())
-						logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
-						if confs >= 1 {
-							break
-						}
-						time.Sleep(10 * time.Second)
-					}
-
-					// Load the output and verify that the pub key script is as calculated
-					// initially.
-					output2, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
-						Hash:  txHash,
-						Index: pack.NewU32(0),
-					})
-					Expect(err).ToNot(HaveOccurred())
-					Expect(output2.PubKeyScript.Equal(pubKeyScript)).To(BeTrue())
-
-					// Validate that the output2 is spendable
-					sigScript, err := getScript(pubKey)
-					Expect(err).NotTo(HaveOccurred())
-					inputs2 := []multichain.UTXOInput{{
-						Output:    output2,
-						SigScript: sigScript,
-					}}
-					recipients2 := []multichain.UTXORecipient{{
-						To:    multichain.Address(pkhAddr.EncodeAddress()),
-						Value: output2.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
-					}}
-					utxoTx2, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Create another transaction using the same inputs, which we will
-					// sign with the original user's address. Validate that none other
-					// than the recipient's signature can spend this UTXO.
-					utxoTx3, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
-					Expect(err).NotTo(HaveOccurred())
-
-					// Get the sighashes that need to be signed, and sign them.
-					sighashes2, err := utxoTx2.Sighashes()
-					signatures2 := make([]pack.Bytes65, len(sighashes2))
-					signatures3 := make([]pack.Bytes65, len(sighashes2))
-					Expect(err).ToNot(HaveOccurred())
-					for i := range sighashes2 {
-						hash := id.Hash(sighashes2[i])
-						privKey := (*id.PrivKey)(recipientPrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures2[i] = pack.NewBytes65(signature)
-					}
-					for i := range sighashes2 {
-						hash := id.Hash(sighashes2[i])
-						privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
-						signature, err := privKey.Sign(&hash)
-						Expect(err).ToNot(HaveOccurred())
-						signatures3[i] = pack.NewBytes65(signature)
-					}
-					Expect(utxoTx2.Sign(signatures2, pack.NewBytes(recipientPubKeyCompressed))).To(Succeed())
-					Expect(utxoTx3.Sign(signatures3, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
-
-					// Try to submit tx signed by invalid spender. This should fail since
-					failingCtx, failingCancelFn := context.WithTimeout(ctx, 5*time.Second)
-					Expect(utxoClient.SubmitTx(failingCtx, utxoTx3)).To(HaveOccurred())
-					failingCancelFn()
-
-					// Submit the signed transaction to the UTXO chain's node.
-					txHash2, err := utxoTx2.Hash()
-					Expect(err).ToNot(HaveOccurred())
-					err = utxoClient.SubmitTx(ctx, utxoTx2)
-					Expect(err).ToNot(HaveOccurred())
-					logger.Debug("[P2SH -> P2KH] submit tx", zap.String("from", recipientP2SH.EncodeAddress()), zap.String("to", pkhAddr.EncodeAddress()), zap.String("txHash", string(txHashToHex(txHash2))))
-
-					// Check confirmations after waiting for the transaction to be in the
-					// mempool.
-					time.Sleep(time.Second)
-
-					for {
-						// Loop until the transaction has at least a few
-						// confirmations.
-						confs, err := confsFn(ctx, txHash2)
-						Expect(err).ToNot(HaveOccurred())
-						logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
-						if confs >= 1 {
-							break
-						}
-						time.Sleep(10 * time.Second)
-					}
-				})
+				//Specify("(P2PKH) build, broadcast and fetch tx", func() {
+				//	// Load private key.
+				//	pkEnv := os.Getenv(utxoChain.privKeyEnv)
+				//	if pkEnv == "" {
+				//		panic(fmt.Sprintf("%v is undefined", utxoChain.privKeyEnv))
+				//	}
+				//	wif, err := btcutil.DecodeWIF(pkEnv)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Get the PKH address from the loaded private key.
+				//	pkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeCompressed()))
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Recipient 1
+				//	pkhAddrUncompressed, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeUncompressed()))
+				//	Expect(err).ToNot(HaveOccurred())
+				//
+				//	// Recipient 2
+				//	recipientPrivKey, err := btcec.NewPrivateKey()
+				//	Expect(err).NotTo(HaveOccurred())
+				//	recipientPubKey := recipientPrivKey.PubKey()
+				//	recipientPubKeyCompressed := recipientPubKey.SerializeCompressed()
+				//	recipientPkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(recipientPubKey.SerializeCompressed()))
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Initialise the UTXO client and fetch the unspent outputs. Also get a
+				//	// function to query the number of block confirmations for a transaction.
+				//	utxoClient, unspentOutputs, confsFn := utxoChain.initialise(utxoChain.rpcURL, pkhAddr)
+				//	Expect(len(unspentOutputs)).To(BeNumerically(">", 0))
+				//	var output multichain.UTXOutput
+				//	thresholdValue := pack.NewU256FromU64(pack.NewU64(2500))
+				//	for _, unspentOutput := range unspentOutputs {
+				//		if unspentOutput.Value.GreaterThan(thresholdValue) {
+				//			output = unspentOutput
+				//			break
+				//		}
+				//	}
+				//
+				//	// Build a transaction
+				//	inputs := []multichain.UTXOInput{
+				//		{Output: multichain.UTXOutput{
+				//			Outpoint: multichain.UTXOutpoint{
+				//				Hash:  output.Outpoint.Hash[:],
+				//				Index: output.Outpoint.Index,
+				//			},
+				//			PubKeyScript: output.PubKeyScript,
+				//			Value:        output.Value,
+				//		}},
+				//	}
+				//	utxoValue1 := pack.NewU256FromU64(pack.NewU64((output.Value.Int().Uint64() - 1000) / 4))
+				//	utxoValue2 := pack.NewU256FromU64(pack.NewU64((output.Value.Int().Uint64() - 1000) * 3 / 4))
+				//	recipients := []multichain.UTXORecipient{
+				//		{
+				//			To:    multichain.Address(pkhAddrUncompressed.EncodeAddress()),
+				//			Value: utxoValue1,
+				//		},
+				//		{
+				//			To:    multichain.Address(recipientPkhAddr.EncodeAddress()),
+				//			Value: utxoValue2,
+				//		},
+				//	}
+				//	utxoTx, err := utxoChain.txBuilder.BuildTx(inputs, recipients)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Get the sighashes that need to be signed, and sign them.
+				//	sighashes, err := utxoTx.Sighashes()
+				//	signatures := make([]pack.Bytes65, len(sighashes))
+				//	Expect(err).ToNot(HaveOccurred())
+				//	for i := range sighashes {
+				//		hash := id.Hash(sighashes[i])
+				//		privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures[i] = pack.NewBytes65(signature)
+				//	}
+				//	Expect(utxoTx.Sign(signatures, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
+				//
+				//	// Submit the signed transaction to the UTXO chain's node.
+				//	txHash, err := utxoTx.Hash()
+				//	Expect(err).ToNot(HaveOccurred())
+				//	err = utxoClient.SubmitTx(ctx, utxoTx)
+				//	Expect(err).ToNot(HaveOccurred())
+				//
+				//	// Check confirmations after waiting for the transaction to be in the
+				//	// mempool.
+				//	time.Sleep(time.Second)
+				//	for {
+				//		// Loop until the transaction has at least a few
+				//		// confirmations.
+				//		confs, err := confsFn(ctx, txHash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
+				//		if confs >= 1 {
+				//			break
+				//		}
+				//		time.Sleep(10 * time.Second)
+				//	}
+				//
+				//	// Load the output and verify that it is equal to the original output.
+				//	output2, _, err := utxoClient.Output(ctx, output.Outpoint)
+				//	Expect(err).ToNot(HaveOccurred())
+				//	Expect(reflect.DeepEqual(output, output2)).To(BeTrue())
+				//
+				//	// Load the first output and verify the value.
+				//	output3, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
+				//		Hash:  txHash,
+				//		Index: pack.NewU32(0),
+				//	})
+				//	Expect(err).ToNot(HaveOccurred())
+				//	Expect(output3.Value).To(Equal(utxoValue1))
+				//
+				//	// Load the second output and verify the value.
+				//	output4, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
+				//		Hash:  txHash,
+				//		Index: pack.NewU32(1),
+				//	})
+				//	Expect(err).ToNot(HaveOccurred())
+				//	Expect(output4.Value).To(Equal(utxoValue2))
+				//
+				//	// Construct UTXO to be signed by invalid key. This UTXO should fail
+				//	// when submitted to the network, since the signer doesn't have the
+				//	// right to spend it.
+				//	// We submit the invalid signed UTXO (which should fail), and wait
+				//	// for a maximum of 5 seconds.
+				//	inputs2 := []multichain.UTXOInput{{
+				//		Output: output4,
+				//	}}
+				//	recipients2 := []multichain.UTXORecipient{{
+				//		To:    multichain.Address(pkhAddr.EncodeAddress()),
+				//		Value: output4.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
+				//	}}
+				//	utxoTx2, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
+				//	Expect(err).NotTo(HaveOccurred())
+				//	sighashes2, err := utxoTx2.Sighashes()
+				//	signatures2 := make([]pack.Bytes65, len(sighashes2))
+				//	for i := range sighashes2 {
+				//		hash := id.Hash(sighashes2[i])
+				//		privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures2[i] = pack.NewBytes65(signature)
+				//	}
+				//	Expect(utxoTx2.Sign(signatures2, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
+				//	failingCtx, failingCancelFn := context.WithTimeout(ctx, 5*time.Second)
+				//	Expect(utxoClient.SubmitTx(failingCtx, utxoTx2)).To(HaveOccurred())
+				//	failingCancelFn()
+				//
+				//	// Try to spend UTXO from valid key. We should be able to successfully
+				//	// submit the signed UTXO to the network.
+				//	utxoTx3, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
+				//	Expect(err).NotTo(HaveOccurred())
+				//	sighashes3, err := utxoTx3.Sighashes()
+				//	signatures3 := make([]pack.Bytes65, len(sighashes3))
+				//	for i := range sighashes3 {
+				//		hash := id.Hash(sighashes3[i])
+				//		privKey := (*id.PrivKey)(recipientPrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures3[i] = pack.NewBytes65(signature)
+				//	}
+				//	Expect(utxoTx3.Sign(signatures3, pack.NewBytes(recipientPubKeyCompressed))).To(Succeed())
+				//	Expect(utxoClient.SubmitTx(ctx, utxoTx3)).NotTo(HaveOccurred())
+				//})
+				//
+				//Specify("(P2SH)  build, broadcast and fetch tx", func() {
+				//	// Load private key.
+				//	pkEnv := os.Getenv(utxoChain.privKeyEnv)
+				//	if pkEnv == "" {
+				//		panic(fmt.Sprintf("%v is undefined", utxoChain.privKeyEnv))
+				//	}
+				//	wif, err := btcutil.DecodeWIF(pkEnv)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Get the PKH address from the loaded private key.
+				//	pkhAddr, err := utxoChain.newAddressPKH(btcutil.Hash160(wif.PrivKey.PubKey().SerializeCompressed()))
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Recipient
+				//	recipientPrivKey, err := btcec.NewPrivateKey()
+				//	Expect(err).NotTo(HaveOccurred())
+				//	recipientPubKey := recipientPrivKey.PubKey()
+				//	recipientPubKeyCompressed := recipientPubKey.SerializeCompressed()
+				//	pubKey := pack.Bytes(((*btcec.PublicKey)(recipientPubKey)).SerializeCompressed())
+				//	script, err := getScript(pubKey)
+				//	Expect(err).NotTo(HaveOccurred())
+				//	pubKeyScript, err := getPubKeyScript(pubKey)
+				//	Expect(err).NotTo(HaveOccurred())
+				//	recipientP2SH, err := utxoChain.newAddressSH(script)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Initialise the UTXO client and fetch the unspent outputs. Also get a
+				//	// function to query the number of block confirmations for a transaction.
+				//	utxoClient, unspentOutputs, confsFn := utxoChain.initialise(utxoChain.rpcURL, pkhAddr)
+				//	Expect(len(unspentOutputs)).To(BeNumerically(">", 0))
+				//	var output multichain.UTXOutput
+				//	thresholdValue := pack.NewU256FromU64(pack.NewU64(2500))
+				//	for _, unspentOutput := range unspentOutputs {
+				//		if unspentOutput.Value.GreaterThan(thresholdValue) {
+				//			output = unspentOutput
+				//			break
+				//		}
+				//	}
+				//
+				//	// Build a transaction
+				//	inputs := []multichain.UTXOInput{
+				//		{Output: multichain.UTXOutput{
+				//			Outpoint: multichain.UTXOutpoint{
+				//				Hash:  output.Outpoint.Hash[:],
+				//				Index: output.Outpoint.Index,
+				//			},
+				//			PubKeyScript: output.PubKeyScript,
+				//			Value:        output.Value,
+				//		}},
+				//	}
+				//	recipients := []multichain.UTXORecipient{
+				//		{
+				//			To:    multichain.Address(recipientP2SH.EncodeAddress()),
+				//			Value: output.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
+				//		},
+				//	}
+				//	utxoTx, err := utxoChain.txBuilder.BuildTx(inputs, recipients)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Get the sighashes that need to be signed, and sign them.
+				//	sighashes, err := utxoTx.Sighashes()
+				//	signatures := make([]pack.Bytes65, len(sighashes))
+				//	Expect(err).ToNot(HaveOccurred())
+				//	for i := range sighashes {
+				//		hash := id.Hash(sighashes[i])
+				//		privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures[i] = pack.NewBytes65(signature)
+				//	}
+				//	Expect(utxoTx.Sign(signatures, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
+				//	// Submit the signed transaction to the UTXO chain's node.
+				//	txHash, err := utxoTx.Hash()
+				//	Expect(err).ToNot(HaveOccurred())
+				//	err = utxoClient.SubmitTx(ctx, utxoTx)
+				//	Expect(err).ToNot(HaveOccurred())
+				//	logger.Debug("[P2KH -> P2SH] submit tx", zap.String("from", pkhAddr.EncodeAddress()), zap.String("to", recipientP2SH.EncodeAddress()), zap.String("txHash", string(txHashToHex(txHash))))
+				//	// Check confirmations after waiting for the transaction to be in the
+				//	// mempool.
+				//	time.Sleep(time.Second)
+				//
+				//	for {
+				//		// Loop until the transaction has at least a few
+				//		// confirmations.
+				//		confs, err := confsFn(ctx, txHash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
+				//		if confs >= 1 {
+				//			break
+				//		}
+				//		time.Sleep(10 * time.Second)
+				//	}
+				//
+				//	// Load the output and verify that the pub key script is as calculated
+				//	// initially.
+				//	output2, _, err := utxoClient.Output(ctx, multichain.UTXOutpoint{
+				//		Hash:  txHash,
+				//		Index: pack.NewU32(0),
+				//	})
+				//	Expect(err).ToNot(HaveOccurred())
+				//	Expect(output2.PubKeyScript.Equal(pubKeyScript)).To(BeTrue())
+				//
+				//	// Validate that the output2 is spendable
+				//	sigScript, err := getScript(pubKey)
+				//	Expect(err).NotTo(HaveOccurred())
+				//	inputs2 := []multichain.UTXOInput{{
+				//		Output:    output2,
+				//		SigScript: sigScript,
+				//	}}
+				//	recipients2 := []multichain.UTXORecipient{{
+				//		To:    multichain.Address(pkhAddr.EncodeAddress()),
+				//		Value: output2.Value.Sub(pack.NewU256FromU64(pack.U64(500))),
+				//	}}
+				//	utxoTx2, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Create another transaction using the same inputs, which we will
+				//	// sign with the original user's address. Validate that none other
+				//	// than the recipient's signature can spend this UTXO.
+				//	utxoTx3, err := utxoChain.txBuilder.BuildTx(inputs2, recipients2)
+				//	Expect(err).NotTo(HaveOccurred())
+				//
+				//	// Get the sighashes that need to be signed, and sign them.
+				//	sighashes2, err := utxoTx2.Sighashes()
+				//	signatures2 := make([]pack.Bytes65, len(sighashes2))
+				//	signatures3 := make([]pack.Bytes65, len(sighashes2))
+				//	Expect(err).ToNot(HaveOccurred())
+				//	for i := range sighashes2 {
+				//		hash := id.Hash(sighashes2[i])
+				//		privKey := (*id.PrivKey)(recipientPrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures2[i] = pack.NewBytes65(signature)
+				//	}
+				//	for i := range sighashes2 {
+				//		hash := id.Hash(sighashes2[i])
+				//		privKey := (*id.PrivKey)(wif.PrivKey.ToECDSA())
+				//		signature, err := privKey.Sign(&hash)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		signatures3[i] = pack.NewBytes65(signature)
+				//	}
+				//	Expect(utxoTx2.Sign(signatures2, pack.NewBytes(recipientPubKeyCompressed))).To(Succeed())
+				//	Expect(utxoTx3.Sign(signatures3, pack.NewBytes(wif.SerializePubKey()))).To(Succeed())
+				//
+				//	// Try to submit tx signed by invalid spender. This should fail since
+				//	failingCtx, failingCancelFn := context.WithTimeout(ctx, 5*time.Second)
+				//	Expect(utxoClient.SubmitTx(failingCtx, utxoTx3)).To(HaveOccurred())
+				//	failingCancelFn()
+				//
+				//	// Submit the signed transaction to the UTXO chain's node.
+				//	txHash2, err := utxoTx2.Hash()
+				//	Expect(err).ToNot(HaveOccurred())
+				//	err = utxoClient.SubmitTx(ctx, utxoTx2)
+				//	Expect(err).ToNot(HaveOccurred())
+				//	logger.Debug("[P2SH -> P2KH] submit tx", zap.String("from", recipientP2SH.EncodeAddress()), zap.String("to", pkhAddr.EncodeAddress()), zap.String("txHash", string(txHashToHex(txHash2))))
+				//
+				//	// Check confirmations after waiting for the transaction to be in the
+				//	// mempool.
+				//	time.Sleep(time.Second)
+				//
+				//	for {
+				//		// Loop until the transaction has at least a few
+				//		// confirmations.
+				//		confs, err := confsFn(ctx, txHash2)
+				//		Expect(err).ToNot(HaveOccurred())
+				//		logger.Debug(fmt.Sprintf("[%v] confirming", utxoChain.chain), zap.Uint64("current", uint64(confs)))
+				//		if confs >= 1 {
+				//			break
+				//		}
+				//		time.Sleep(10 * time.Second)
+				//	}
+				//})
 
 				Specify("(P2TR)  build, broadcast and fetch tx", func() {
 					if utxoChain.chain != multichain.Bitcoin {
@@ -1294,11 +1294,16 @@ var _ = Describe("Multichain", func() {
 					Expect(err).NotTo(HaveOccurred())
 
 					// Recipient
-					recipientPrivKey, err := btcec.NewPrivateKey()
+					keyBytes, err := hex.DecodeString("<PRIV KEY>")
 					Expect(err).NotTo(HaveOccurred())
+					recipientPrivKey, _ := btcec.PrivKeyFromBytes(keyBytes)
+					log.Print(hex.EncodeToString(recipientPrivKey.Serialize()))
+					tweaked := txscript.TweakTaprootPrivKey(recipientPrivKey, []byte{2})
+					log.Println(hex.EncodeToString(tweaked.Serialize()))
+					recipientPrivKey, _ = btcec.PrivKeyFromBytes(keyBytes)
 					recipientPubKey := recipientPrivKey.PubKey()
 					recipientPubKeyCompressed := recipientPubKey.SerializeCompressed()
-					recipientP2TR, err := btcutil.NewAddressTaproot(schnorr.SerializePubKey(txscript.ComputeTaprootKeyNoScript(recipientPubKey)), &chaincfg.RegressionNetParams)
+					recipientP2TR, err := btcutil.NewAddressTaproot(schnorr.SerializePubKey(txscript.ComputeTaprootOutputKey(recipientPubKey, []byte{2})), &chaincfg.RegressionNetParams)
 					Expect(err).NotTo(HaveOccurred())
 
 					// Initialise the UTXO client and fetch the unspent outputs. Also get a
@@ -1400,16 +1405,21 @@ var _ = Describe("Multichain", func() {
 					signatures3 := make([]pack.Bytes65, len(sighashes2))
 					Expect(err).ToNot(HaveOccurred())
 					// the privkey was generated using ComputeTaprootKeyNoScript hence []byte{} used for tapscript
-					privKeyTweak := txscript.TweakTaprootPrivKey(recipientPrivKey, []byte{})
 					for i := range sighashes2 {
 						hash := id.Hash(sighashes2[i])
 						// special signature method for schnorr \
 						// (creates 64 bytes hence padded with 0 byte at end)
-						signature, err := schnorr.Sign(privKeyTweak, hash[:])
+						log.Print("sign sigHash = ", hex.EncodeToString(hash[:]))
+						var sigInput string
+						// Taking input from user
+						if _, err := fmt.Scanln(&sigInput); err != nil {
+							panic(err)
+						}
+						log.Print("input=", sigInput)
+						serialized, err := hex.DecodeString(sigInput)
 						Expect(err).ToNot(HaveOccurred())
-						serialized := signature.Serialize()
 						sig := id.Signature{}
-						copy(sig[:], append(serialized, 0))
+						copy(sig[:], append(serialized[1:], 0))
 						signatures2[i] = pack.NewBytes65(sig)
 					}
 					for i := range sighashes2 {
